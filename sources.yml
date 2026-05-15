@@ -1,0 +1,51 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Datos crudos cargados desde S3 — parquets aplanados"
+    schema: raw
+    tables:
+      - name: events
+        description: "Eventos logisticos — una fila por evento"
+        columns:
+          - name: h_logistic_order_id
+            description: "ID de la orden logistica"
+            tests:
+              - not_null
+          - name: h_event_type
+            description: "Tipo de evento"
+            tests:
+              - not_null
+          - name: h_country
+            description: "Pais"
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['CL', 'PE', 'CO']
+          - name: h_datetime
+            description: "Timestamp del evento"
+            tests:
+              - not_null
+
+      - name: event_items
+        description: "Items por evento — una fila por item"
+        columns:
+          - name: logistic_order_id
+            tests:
+              - not_null
+          - name: sku
+            description: "SKU del producto"
+          - name: seller_id
+            description: "ID del seller"
+
+      - name: event_packages
+        description: "Paquetes por evento — una fila por paquete"
+        columns:
+          - name: logistic_order_id
+            tests:
+              - not_null
+          - name: promised_date
+            description: >
+              MAP con las fechas prometidas. Keys: dateTo, dateFrom,
+              serviceCategory, timeRangeFrom, timeRangeTo, collectAvailabilityDate.
+              carrier y tracking_number estan vacios en datos origen (confirmado).

@@ -1,0 +1,37 @@
+name: 'falabella_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'falabella'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  falabella_dbt:
+    staging:
+      +materialized: view
+      +schema: staging
+    intermediate:
+      +materialized: table
+      +schema: intermediate
+    marts:
+      +materialized: table
+      +schema: marts
+
+vars:
+  # Pais foco del proyecto
+  pais_foco: 'CL'
+  # Fecha minima valida — excluye eventos reprocesados
+  fecha_minima: '2025-01-01'
+  # Meses de alta estacionalidad — tratados diferente en modelos
+  meses_alta_estacionalidad: ['2025-06', '2025-10', '2025-11', '2025-12']

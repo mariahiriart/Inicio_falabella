@@ -1,0 +1,36 @@
+# profiles.yml
+# Ubicar en ~/.dbt/profiles.yml (NO dentro del repo)
+# NUNCA subir este archivo a git
+
+falabella:
+  target: prod
+  outputs:
+    prod:
+      type: postgres
+      host: "{{ env_var('DBT_DB_HOST') }}"
+      port: 5432
+      dbname: "{{ env_var('DBT_DB_NAME', 'falabella') }}"
+      user: "{{ env_var('DBT_DB_USER') }}"
+      password: "{{ env_var('DBT_DB_PASSWORD') }}"
+      schema: staging
+      threads: 4
+      connect_timeout: 30
+      sslmode: require
+
+    dev:
+      type: postgres
+      host: "{{ env_var('DBT_DB_HOST') }}"
+      port: 5432
+      dbname: "{{ env_var('DBT_DB_NAME', 'falabella') }}"
+      user: "{{ env_var('DBT_DB_USER') }}"
+      password: "{{ env_var('DBT_DB_PASSWORD') }}"
+      schema: staging_dev
+      threads: 2
+      connect_timeout: 30
+      sslmode: require
+
+# Variables necesarias en .env o entorno:
+# DBT_DB_HOST=tu-rds-endpoint.rds.amazonaws.com
+# DBT_DB_NAME=falabella
+# DBT_DB_USER=falabella_user
+# DBT_DB_PASSWORD=tu_password
