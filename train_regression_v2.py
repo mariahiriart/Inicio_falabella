@@ -231,12 +231,24 @@ def evaluar(model, X, y_raw, split_name, es_desvio=False):
     else:
         y_pred = np.clip(y_pred, 0, None)
 
-    mae  = mean_absolute_error(y_raw, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_raw, y_pred))
-    r2   = r2_score(y_raw, y_pred)
+    # Castear a float64 y limpiar NaN/inf para que sklearn no falle
+    y_pred = np.array(y_pred, dtype=np.float64)
+    y_true = np.array(y_raw,  dtype=np.float64)
 
-    dentro_24h = np.mean(np.abs(y_pred - y_raw) <= 24) * 100
-    dentro_48h = np.mean(np.abs(y_pred - y_raw) <= 48) * 100
+    # Filtrar filas con NaN o inf en cualquiera de los dos arrays
+    mask = np.isfinite(y_pred) & np.isfinite(y_true)
+    n_invalidos = (~mask).sum()
+    if n_invalidos > 0:
+        print(f"    ⚠ {n_invalidos:,} filas con NaN/inf descartadas de la evaluación", flush=True)
+    y_pred = y_pred[mask]
+    y_true = y_true[mask]
+
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2   = r2_score(y_true, y_pred)
+
+    dentro_24h = np.mean(np.abs(y_pred - y_true) <= 24) * 100
+    dentro_48h = np.mean(np.abs(y_pred - y_true) <= 48) * 100
 
     print(f"    [{split_name}] MAE={mae:.2f}h ({mae/24:.2f}d)  RMSE={rmse:.2f}h  R²={r2:.4f}  ±24h={dentro_24h:.1f}%", flush=True)
 
@@ -331,6 +343,27 @@ def main():
         es_desvio = exp["target"] == "desvio_sla"
         con_sla  = exp["con_sla"]
 
+        # Si ya existe el resultado, saltearlo
+        results_path = OUTPUT_DIR / f"results_{nombre}.json"
+        model_path   = OUTPUT_DIR / f"model_lgbm_{nombre}.pkl"
+        if results_path.exists() and model_path.exists():
+            print(f"\n  ⏭ {nombre} ya completado, cargando resultados...", flush=True)
+            with open(results_path) as f:
+                r = json.load(f)
+            resultados.append({
+                "nombre":    nombre,
+                "target":    exp["target"],
+                "con_sla":   con_sla,
+                "mae_val":   r["val"]["mae_horas"],
+                "rmse_val":  r["val"]["rmse_horas"],
+                "r2_val":    r["val"]["r2"],
+                "mae_test":  r["test"]["mae_horas"],
+                "rmse_test": r["test"]["rmse_horas"],
+                "r2_test":   r["test"]["r2"],
+            })
+            imprimir_comparacion(resultados)
+            continue
+
         print(f"\n{'='*60}", flush=True)
         print(f"EXPERIMENTO: {nombre} | target={exp['target']} | SLA={'Sí' if con_sla else 'No'}", flush=True)
         print(f"{'='*60}", flush=True)
@@ -422,4 +455,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
