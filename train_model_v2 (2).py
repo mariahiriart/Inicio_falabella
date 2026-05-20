@@ -67,10 +67,9 @@ FEATURES_NUMERICAS = [
 
 FEATURES_CATEGORICAS = [
     "service_category",
-    "source_order_type",
     "seller_id",
     "created_by",
-    "franja_horaria",      # nueva v2
+    "franja_horaria",
 ]
 
 ALL_FEATURES = FEATURES_NUMERICAS + FEATURES_CATEGORICAS
