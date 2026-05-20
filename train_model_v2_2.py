@@ -96,8 +96,16 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
-def cargar_mes(engine, year_month: str, encoders: dict, fit: bool = False):
-    """Carga un mes completo y devuelve X, y listos para LightGBM."""
+def get_fresh_engine():
+    url = (
+        f"postgresql+psycopg2://{os.environ['DBT_DB_USER']}:{os.environ['DBT_DB_PASSWORD']}"
+        f"@{os.environ['DBT_DB_HOST']}:5432/{os.environ['DBT_DB_NAME']}?sslmode=require"
+    )
+    return create_engine(url, pool_pre_ping=True, pool_recycle=60)
+
+
+def cargar_mes(year_month: str, encoders: dict, fit: bool = False):
+    """Carga un mes completo con retry en caso de SSL timeout."""
     print(f"    Mes {year_month}...", end=" ", flush=True)
     t0 = time.time()
 
@@ -108,8 +116,18 @@ def cargar_mes(engine, year_month: str, encoders: dict, fit: bool = False):
         WHERE year_month = :ym
     """)
 
-    with engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={"ym": year_month})
+    for intento in range(3):
+        try:
+            eng = get_fresh_engine()
+            with eng.connect() as conn:
+                df = pd.read_sql(query, conn, params={"ym": year_month})
+            eng.dispose()
+            break
+        except Exception as e:
+            print(f"\n    Reintento {intento+1}/3 por error: {str(e)[:50]}", flush=True)
+            time.sleep(5)
+            if intento == 2:
+                raise
 
     if len(df) == 0:
         print(f"0 filas — saltando", flush=True)
@@ -145,7 +163,7 @@ def cargar_split_completo(engine, meses, encoders, fit=False, nombre=""):
     print(f"  Cargando {nombre} ({len(meses)} meses)...", flush=True)
     Xs, ys = [], []
     for mes in meses:
-        X, y, encoders = cargar_mes(engine, mes, encoders, fit=fit)
+        X, y, encoders = cargar_mes(mes, encoders, fit=fit)
         if X is not None:
             Xs.append(X)
             ys.append(y)
