@@ -1,18 +1,18 @@
 """
 Agente de Telegram — Predictor de disrupciones Falabella Chile.
-Cerebro: Claude claude-sonnet-4-20250514
+Cerebro: Kimi (Moonshot AI) via OpenAI SDK
 Herramientas: modelo ML v2 + consultas RDS
 
 El agente entiende lenguaje natural, extrae los datos de la orden,
 busca el histórico en RDS y predice la disrupción con explicación.
 
 Uso:
-    pip3 install python-telegram-bot anthropic
-    python3 agente_falabella.py
+    pip3 install python-telegram-bot openai
+    python3 agente_falabella_kimi.py
 
 Requiere:
     - model_lgbm_v2.pkl en ml_outputs/
-    - .env con credenciales RDS y ANTHROPIC_API_KEY
+    - .env con credenciales RDS y KIMI_API_KEY
 """
 
 import os, json, pickle, logging, warnings, re
@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-import anthropic
+from openai import OpenAI
 
 from telegram import Update
 from telegram.ext import (
@@ -35,10 +35,10 @@ load_dotenv("/home/ec2-user/Inicio_falabella/.env")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-TOKEN         = "8836242266:AAHDQGPqlsOFGJFXQu1M_yPt-jz8Wv7PfQs"
-OUTPUT_DIR    = Path("/home/ec2-user/Inicio_falabella/ml_outputs")
-MODEL_PATH    = OUTPUT_DIR / "model_lgbm_v2.pkl"
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TOKEN      = "8836242266:AAHDQGPqlsOFGJFXQu1M_yPt-jz8Wv7PfQs"
+OUTPUT_DIR = Path("/home/ec2-user/Inicio_falabella/ml_outputs")
+MODEL_PATH = OUTPUT_DIR / "model_lgbm_v2.pkl"
+KIMI_KEY   = os.environ.get("KIMI_API_KEY", "")
 
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
@@ -309,105 +309,97 @@ def predecir_orden(
     }
 
 
-# ── Definición de herramientas para Claude ────────────────────────────────────
+# ── Definición de herramientas para Kimi (formato OpenAI) ────────────────────
 
 TOOLS = [
     {
-        "name": "predecir_disrupcion",
-        "description": (
-            "Predice si una orden logística va a tener una disrupción "
-            "usando el modelo ML entrenado con 15M de órdenes de Falabella Chile. "
-            "Llamar cuando el usuario proporcione datos de una orden nueva."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "service_category": {
-                    "type": "string",
-                    "description": "Categoría del servicio: REGULAR, MESON, DATE_RANGE, SAME_DAY, EXPRESS, TO_CAR",
+        "type": "function",
+        "function": {
+            "name": "predecir_disrupcion",
+            "description": (
+                "Predice si una orden logística va a tener una disrupción "
+                "usando el modelo ML entrenado con 15M de órdenes de Falabella Chile. "
+                "Llamar cuando el usuario proporcione datos de una orden nueva."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_category": {
+                        "type": "string",
+                        "description": "Categoría del servicio: REGULAR, MESON, DATE_RANGE, SAME_DAY, EXPRESS, TO_CAR",
+                    },
+                    "seller_id": {
+                        "type": "string",
+                        "description": "ID del seller/vendedor",
+                    },
+                    "sla_horas": {
+                        "type": "number",
+                        "description": "Horas entre creación y entrega prometida al cliente",
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "description": "Fecha y hora de creación en formato ISO. Si no se especifica usar ahora.",
+                    },
+                    "total_items": {
+                        "type": "integer",
+                        "description": "Cantidad total de items en la orden",
+                    },
+                    "distinct_skus": {
+                        "type": "integer",
+                        "description": "Cantidad de SKUs distintos",
+                    },
+                    "is_click_and_collect": {
+                        "type": "integer",
+                        "description": "1 si es retiro en tienda, 0 si es delivery",
+                    },
+                    "is_high_season": {
+                        "type": "integer",
+                        "description": "1 si es temporada alta, 0 si no",
+                    },
+                    "has_insurance": {
+                        "type": "integer",
+                        "description": "1 si tiene seguro, 0 si no",
+                    },
                 },
-                "seller_id": {
-                    "type": "string",
-                    "description": "ID del seller/vendedor",
-                },
-                "sla_horas": {
-                    "type": "number",
-                    "description": "Horas entre creación y entrega prometida al cliente",
-                },
-                "created_at": {
-                    "type": "string",
-                    "description": "Fecha y hora de creación en formato ISO. Si no se especifica usar ahora.",
-                },
-                "total_items": {
-                    "type": "integer",
-                    "description": "Cantidad total de items en la orden",
-                    "default": 1,
-                },
-                "distinct_skus": {
-                    "type": "integer",
-                    "description": "Cantidad de SKUs distintos",
-                    "default": 1,
-                },
-                "is_click_and_collect": {
-                    "type": "integer",
-                    "description": "1 si es retiro en tienda, 0 si es delivery",
-                    "default": 0,
-                },
-                "is_high_season": {
-                    "type": "integer",
-                    "description": "1 si es temporada alta, 0 si no",
-                    "default": 0,
-                },
-                "has_insurance": {
-                    "type": "integer",
-                    "description": "1 si tiene seguro, 0 si no",
-                    "default": 0,
-                },
+                "required": ["service_category", "seller_id", "sla_horas"],
             },
-            "required": ["service_category", "seller_id", "sla_horas"],
         },
     },
     {
-        "name": "consultar_tramo_historico",
-        "description": (
-            "Consulta en qué tramo logístico (última milla, depósito, despacho) "
-            "históricamente fallan las órdenes de un seller y categoría específicos. "
-            "Llamar cuando el usuario quiera saber dónde suelen ocurrir las disrupciones."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "seller_id": {
-                    "type": "string",
-                    "description": "ID del seller",
+        "type": "function",
+        "function": {
+            "name": "consultar_tramo_historico",
+            "description": (
+                "Consulta en qué tramo logístico históricamente fallan las órdenes "
+                "de un seller y categoría. Llamar cuando el usuario quiera saber "
+                "dónde suelen ocurrir las disrupciones."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seller_id": {"type": "string", "description": "ID del seller"},
+                    "service_category": {"type": "string", "description": "Categoría del servicio"},
                 },
-                "service_category": {
-                    "type": "string",
-                    "description": "Categoría del servicio",
-                },
+                "required": ["seller_id", "service_category"],
             },
-            "required": ["seller_id", "service_category"],
         },
     },
     {
-        "name": "consultar_historico_seller",
-        "description": (
-            "Obtiene las tasas históricas de disrupción de un seller y categoría. "
-            "Llamar cuando el usuario quiera saber el historial de un seller específico."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "seller_id": {
-                    "type": "string",
-                    "description": "ID del seller",
+        "type": "function",
+        "function": {
+            "name": "consultar_historico_seller",
+            "description": (
+                "Obtiene las tasas históricas de disrupción de un seller y categoría. "
+                "Llamar cuando el usuario quiera saber el historial de un seller específico."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seller_id": {"type": "string", "description": "ID del seller"},
+                    "service_category": {"type": "string", "description": "Categoría del servicio"},
                 },
-                "service_category": {
-                    "type": "string",
-                    "description": "Categoría del servicio",
-                },
+                "required": ["seller_id", "service_category"],
             },
-            "required": ["seller_id", "service_category"],
         },
     },
 ]
@@ -445,86 +437,76 @@ El modelo tiene AUC-ROC de 0.929 y detecta 8 de cada 10 disrupciones antes de qu
 
 async def procesar_con_claude(mensaje: str, historial: list) -> str:
     """
-    Manda el mensaje a Claude con las herramientas disponibles.
-    Claude decide qué herramientas usar y genera la respuesta final.
+    Manda el mensaje a Kimi (via OpenAI SDK) con las herramientas disponibles.
+    Kimi decide qué herramientas usar y genera la respuesta final.
     """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    client = OpenAI(
+        api_key=KIMI_KEY,
+        base_url="https://api.moonshot.cn/v1"
+    )
 
-    messages = historial + [{"role": "user", "content": mensaje}]
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + historial
+        + [{"role": "user", "content": mensaje}]
+    )
 
-    # Loop del agente — Claude puede usar múltiples herramientas
-    for _ in range(5):  # máximo 5 rondas
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
+    # Loop del agente — Kimi puede usar múltiples herramientas
+    for _ in range(5):
+        response = client.chat.completions.create(
+            model="moonshot-v1-32k",
             messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=1000,
+            temperature=0.3,
         )
 
-        # Si Claude terminó de razonar
-        if response.stop_reason == "end_turn":
-            texto = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    texto += block.text
-            return texto
+        msg = response.choices[0].message
 
-        # Si Claude quiere usar herramientas
-        if response.stop_reason == "tool_use":
-            # Agregar respuesta de Claude al historial
+        # Si Kimi terminó — no hay más herramientas que usar
+        if not msg.tool_calls:
+            return msg.content or "No pude generar una respuesta."
+
+        # Kimi quiere usar herramientas — agregarlas al historial
+        messages.append(msg)
+
+        # Ejecutar cada herramienta
+        for tool_call in msg.tool_calls:
+            tool_name  = tool_call.function.name
+            tool_input = json.loads(tool_call.function.arguments)
+
+            logger.info(f"Herramienta: {tool_name} — input: {tool_input}")
+
+            if tool_name == "predecir_disrupcion":
+                resultado = predecir_orden(
+                    service_category     = tool_input.get("service_category", "REGULAR"),
+                    seller_id            = tool_input.get("seller_id", "DESCONOCIDO"),
+                    sla_horas            = float(tool_input.get("sla_horas", 48)),
+                    created_at           = tool_input.get("created_at", datetime.now().isoformat()),
+                    total_items          = int(tool_input.get("total_items", 1)),
+                    distinct_skus        = int(tool_input.get("distinct_skus", 1)),
+                    is_click_and_collect = int(tool_input.get("is_click_and_collect", 0)),
+                    is_high_season       = int(tool_input.get("is_high_season", 0)),
+                    has_insurance        = int(tool_input.get("has_insurance", 0)),
+                )
+            elif tool_name == "consultar_tramo_historico":
+                resultado = buscar_tramo_historico(
+                    seller_id        = tool_input.get("seller_id", ""),
+                    service_category = tool_input.get("service_category", "REGULAR"),
+                )
+            elif tool_name == "consultar_historico_seller":
+                resultado = buscar_historico_seller(
+                    seller_id        = tool_input.get("seller_id", ""),
+                    service_category = tool_input.get("service_category", "REGULAR"),
+                )
+            else:
+                resultado = {"error": f"Herramienta {tool_name} no encontrada"}
+
             messages.append({
-                "role": "assistant",
-                "content": response.content
-            })
-
-            # Ejecutar cada herramienta que Claude pidió
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    tool_name = block.name
-                    tool_input = block.input
-
-                    logger.info(f"Ejecutando herramienta: {tool_name} con {tool_input}")
-
-                    # Ejecutar la herramienta correspondiente
-                    if tool_name == "predecir_disrupcion":
-                        resultado = predecir_orden(
-                            service_category      = tool_input.get("service_category", "REGULAR"),
-                            seller_id             = tool_input.get("seller_id", "DESCONOCIDO"),
-                            sla_horas             = float(tool_input.get("sla_horas", 48)),
-                            created_at            = tool_input.get("created_at", datetime.now().isoformat()),
-                            total_items           = int(tool_input.get("total_items", 1)),
-                            distinct_skus         = int(tool_input.get("distinct_skus", 1)),
-                            is_click_and_collect  = int(tool_input.get("is_click_and_collect", 0)),
-                            is_high_season        = int(tool_input.get("is_high_season", 0)),
-                            has_insurance         = int(tool_input.get("has_insurance", 0)),
-                        )
-
-                    elif tool_name == "consultar_tramo_historico":
-                        resultado = buscar_tramo_historico(
-                            seller_id        = tool_input.get("seller_id", ""),
-                            service_category = tool_input.get("service_category", "REGULAR"),
-                        )
-
-                    elif tool_name == "consultar_historico_seller":
-                        resultado = buscar_historico_seller(
-                            seller_id        = tool_input.get("seller_id", ""),
-                            service_category = tool_input.get("service_category", "REGULAR"),
-                        )
-                    else:
-                        resultado = {"error": f"Herramienta {tool_name} no encontrada"}
-
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     json.dumps(resultado, ensure_ascii=False, default=str),
-                    })
-
-            # Agregar resultados al historial
-            messages.append({
-                "role":    "user",
-                "content": tool_results,
+                "role":         "tool",
+                "tool_call_id": tool_call.id,
+                "content":      json.dumps(resultado, ensure_ascii=False, default=str),
             })
 
     return "Lo siento, no pude procesar la solicitud. Intentá de nuevo."
@@ -644,8 +626,8 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if not ANTHROPIC_KEY:
-        print("ERROR: ANTHROPIC_API_KEY no encontrada en .env", flush=True)
+    if not KIMI_KEY:
+        print("ERROR: KIMI_API_KEY no encontrada en .env", flush=True)
         return
 
     print("Iniciando Agente Falabella en Telegram...", flush=True)
