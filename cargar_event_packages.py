@@ -12,6 +12,8 @@ Tiempo estimado: 20-40 minutos (7.2 GB)
 
 import os, gc, time, warnings, io
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -83,6 +85,23 @@ COLS = [
 ]
 
 
+def read_parquet_safe(fpath: str) -> pd.DataFrame:
+    """Lee un parquet tolerando columnas con schema incompatible (string vs dictionary)."""
+    try:
+        return pd.read_parquet(fpath)
+    except Exception:
+        pf = pq.ParquetFile(fpath)
+        frames = []
+        for i in range(pf.metadata.num_row_groups):
+            t = pf.read_row_group(i)
+            for name in t.schema.names:
+                col = t.column(name)
+                if pa.types.is_dictionary(col.type):
+                    t = t.set_column(t.schema.get_field_index(name), name, col.cast(pa.string()))
+            frames.append(t.to_pandas())
+        return pd.concat(frames, ignore_index=True)
+
+
 def copy_df_to_rds(df):
     """Inserta un DataFrame en RDS via COPY."""
     eng = get_engine()
@@ -127,7 +146,7 @@ def cargar_mes(year_month: str) -> int:
 
     for i, fpath in enumerate(archivos, 1):
         try:
-            df = pd.read_parquet(fpath)
+            df = read_parquet_safe(fpath)
         except Exception as e:
             print(f"    [{i}/{len(archivos)}] ERROR: {e}", flush=True)
             continue
