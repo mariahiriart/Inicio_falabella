@@ -83,27 +83,8 @@ COLS = [
 ]
 
 
-def cargar_mes(year_month: str) -> int:
-    """Lee un mes desde S3 y lo inserta en RDS via COPY (10-50x más rápido que INSERT)."""
-    s3_path = f"{S3_BASE}/year_month={year_month}/"
-    print(f"  {year_month}...", end=" ", flush=True)
-    t0 = time.time()
-
-    try:
-        df = pd.read_parquet(s3_path)
-    except Exception as e:
-        print(f"ERROR leyendo S3: {e}", flush=True)
-        return 0
-
-    if len(df) == 0:
-        print("0 filas", flush=True)
-        return 0
-
-    df["year_month"] = year_month
-    if "event_dt" in df.columns:
-        df["event_dt"] = pd.to_datetime(df["event_dt"], errors="coerce")
-    df = df.reindex(columns=COLS)
-
+def copy_df_to_rds(df):
+    """Inserta un DataFrame en RDS via COPY."""
     eng = get_engine()
     raw_conn = eng.raw_connection()
     try:
@@ -121,9 +102,47 @@ def cargar_mes(year_month: str) -> int:
         raw_conn.close()
     eng.dispose()
 
-    total = len(df)
-    del df; gc.collect()
-    print(f"{total:,} filas en {time.time()-t0:.0f}s", flush=True)
+
+def cargar_mes(year_month: str) -> int:
+    """Lee un mes archivo por archivo desde S3 para no saturar RAM."""
+    import s3fs
+
+    s3_path = f"{S3_BASE}/year_month={year_month}/"
+    t0 = time.time()
+
+    fs = s3fs.S3FileSystem()
+    bucket_prefix = s3_path.replace("s3://", "")
+    try:
+        archivos = sorted([f"s3://{f}" for f in fs.glob(f"{bucket_prefix}*.parquet")])
+    except Exception as e:
+        print(f"  {year_month} ERROR listando S3: {e}", flush=True)
+        return 0
+
+    if not archivos:
+        print(f"  {year_month} 0 archivos", flush=True)
+        return 0
+
+    print(f"  {year_month} — {len(archivos)} archivos", flush=True)
+    total = 0
+
+    for i, fpath in enumerate(archivos, 1):
+        try:
+            df = pd.read_parquet(fpath)
+        except Exception as e:
+            print(f"    [{i}/{len(archivos)}] ERROR: {e}", flush=True)
+            continue
+
+        df["year_month"] = year_month
+        if "event_dt" in df.columns:
+            df["event_dt"] = pd.to_datetime(df["event_dt"], errors="coerce")
+        df = df.reindex(columns=COLS)
+
+        copy_df_to_rds(df)
+        total += len(df)
+        del df; gc.collect()
+        print(f"    [{i}/{len(archivos)}] {total:,} filas  {time.time()-t0:.0f}s", flush=True)
+
+    print(f"  {year_month} LISTO: {total:,} filas en {time.time()-t0:.0f}s", flush=True)
     return total
 
 
