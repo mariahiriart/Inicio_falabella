@@ -10,7 +10,7 @@ Uso:
 Tiempo estimado: 20-40 minutos (7.2 GB)
 """
 
-import os, gc, time, warnings
+import os, gc, time, warnings, io
 import pandas as pd
 from dotenv import load_dotenv
 from pathlib import Path
@@ -76,8 +76,15 @@ def crear_indices(engine):
     print("  Índices creados OK", flush=True)
 
 
-def cargar_mes(engine, year_month: str) -> int:
-    """Lee un mes desde S3 y lo inserta en RDS."""
+COLS = [
+    "logistic_order_id", "event_type", "event_dt", "country",
+    "shipment_id", "package_id", "promised_date", "carrier",
+    "tracking_number", "package_status", "year_month",
+]
+
+
+def cargar_mes(year_month: str) -> int:
+    """Lee un mes desde S3 y lo inserta en RDS via COPY (10-50x más rápido que INSERT)."""
     s3_path = f"{S3_BASE}/year_month={year_month}/"
     print(f"  {year_month}...", end=" ", flush=True)
     t0 = time.time()
@@ -92,37 +99,31 @@ def cargar_mes(engine, year_month: str) -> int:
         print("0 filas", flush=True)
         return 0
 
-    # Agregar year_month como columna
     df["year_month"] = year_month
-
-    # Normalizar tipos
     if "event_dt" in df.columns:
         df["event_dt"] = pd.to_datetime(df["event_dt"], errors="coerce")
+    df = df.reindex(columns=COLS)
 
-    # Insertar en RDS en chunks para no explotar la memoria
-    CHUNK = 100_000
-    total = 0
-    engine.dispose()
     eng = get_engine()
-
-    for i in range(0, len(df), CHUNK):
-        chunk = df.iloc[i:i+CHUNK]
-        chunk.to_sql(
-            "stg_event_packages",
-            eng,
-            schema="staging_marts",
-            if_exists="append",
-            index=False,
-            method="multi",
-            chunksize=5000,
+    raw_conn = eng.raw_connection()
+    try:
+        cursor = raw_conn.cursor()
+        buf = io.StringIO()
+        df.to_csv(buf, index=False, header=False, na_rep="\\N")
+        buf.seek(0)
+        cursor.copy_expert(
+            f"COPY staging_marts.stg_event_packages ({', '.join(COLS)}) FROM STDIN WITH CSV NULL '\\N'",
+            buf,
         )
-        total += len(chunk)
-
+        raw_conn.commit()
+        cursor.close()
+    finally:
+        raw_conn.close()
     eng.dispose()
-    del df; gc.collect()
 
-    elapsed = time.time() - t0
-    print(f"{total:,} filas en {elapsed:.0f}s", flush=True)
+    total = len(df)
+    del df; gc.collect()
+    print(f"{total:,} filas en {time.time()-t0:.0f}s", flush=True)
     return total
 
 
@@ -173,23 +174,26 @@ def main():
             "SELECT COUNT(*) FROM staging_marts.stg_event_packages"
         )).scalar()
 
+    # Detectar meses ya cargados para no reprocesarlos
+    meses_ya_cargados = set()
     if n_exist > 0:
-        print(f"\nYa hay {n_exist:,} filas en la tabla.", flush=True)
-        resp = input("¿Truncar y recargar? (s/n): ").strip().lower()
-        if resp == "s":
-            with engine.connect() as conn:
-                conn.execute(text("TRUNCATE staging_marts.stg_event_packages"))
-                conn.commit()
-            print("Tabla truncada.", flush=True)
-        else:
-            print("Carga cancelada.", flush=True)
-            return
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT DISTINCT year_month FROM staging_marts.stg_event_packages"
+            )).fetchall()
+        meses_ya_cargados = {r[0] for r in rows}
+        print(f"\nYa cargados: {sorted(meses_ya_cargados)}", flush=True)
 
-    # Cargar mes a mes
-    print(f"\nCargando {len(MESES)} meses desde S3...", flush=True)
+    meses_pendientes = [m for m in MESES if m not in meses_ya_cargados]
+    if not meses_pendientes:
+        print("Todos los meses ya están cargados.", flush=True)
+        verificar_carga(engine)
+        return
+
+    print(f"\nCargando {len(meses_pendientes)} meses pendientes desde S3...", flush=True)
     total_filas = 0
-    for mes in MESES:
-        n = cargar_mes(engine, mes)
+    for mes in meses_pendientes:
+        n = cargar_mes(mes)
         total_filas += n
         gc.collect()
 
