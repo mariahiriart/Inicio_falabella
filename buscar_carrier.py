@@ -24,12 +24,12 @@ def buscar_por_carrier():
     bucket_prefix = S3_PATH_TRACKING.replace("s3://", "")
     
     try:
-        # Listar todos los archivos .parquet dentro de la ruta (incluyendo subcarpetas si las hay)
+        # Listar todos los archivos .parquet de forma recursiva usando fs.find (evita el bug de 'recursive')
         print("Buscando archivos en S3...", flush=True)
-        archivos = sorted([f"s3://{f}" for f in fs.glob(f"{bucket_prefix}/**/*.parquet", recursive=True)])
-        if not archivos:
-            # Intentar búsqueda simple sin subcarpetas si falló la recursiva
-            archivos = sorted([f"s3://{f}" for f in fs.glob(f"{bucket_prefix}*.parquet")])
+        archivos = sorted([
+            f"s3://{f}" for f in fs.find(bucket_prefix) 
+            if f.endswith(".parquet")
+        ])
     except Exception as e:
         print(f"Error al conectar o listar S3: {e}")
         return
