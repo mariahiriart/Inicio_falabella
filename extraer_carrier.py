@@ -1,19 +1,12 @@
 """
-Extractor de carrier desde S3 → RDS — versión optimizada.
-
-Mejoras vs v1:
-  - Lee solo columnas 'header' y 'data' desde S3 (más rápido)
-  - Procesa 3 meses en paralelo con ThreadPoolExecutor
-  - Parseo vectorizado con apply en lugar de loop
-
-Uso:
-    python3 extraer_carrier_opt.py
+Extractor de carrier desde S3 → RDS — versión v2 (bajo consumo de memoria).
+Lee cada archivo parquet individualmente y libera memoria entre cada uno.
 """
 
 import os, gc, json, time, warnings
+import boto3
 import pandas as pd
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
@@ -26,7 +19,7 @@ MESES = [
     "202601","202602"
 ]
 
-S3_BASE    = "s3://falabella-data"
+S3_BUCKET  = "falabella-data"
 EVENT_TYPE = "FULFILMENT_ORDER_ITEM_QUANTITY_STATE_CHANGED"
 
 
@@ -55,7 +48,6 @@ def crear_tabla():
 
 
 def extraer_carrier_json(data_str):
-    """Extrae carrierCode y carrierName del JSON de data."""
     try:
         data = json.loads(data_str) if isinstance(data_str, str) else data_str
         for item in data.get("orderItems", []):
@@ -70,26 +62,36 @@ def extraer_carrier_json(data_str):
     return None, None
 
 
-def procesar_mes(year_month_short: str) -> pd.DataFrame:
-    """Lee un mes desde S3 y extrae carriers."""
-    s3_path   = f"{S3_BASE}/{year_month_short}/"
-    year_month = f"{year_month_short[:4]}-{year_month_short[4:]}"
+def listar_archivos_s3(mes: str):
+    """Lista todos los archivos parquet de un mes en S3."""
+    s3 = boto3.client("s3")
+    prefix = f"{mes}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    archivos = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".parquet"):
+                archivos.append(key)
+    return archivos
 
-    print(f"  {year_month} leyendo S3...", end=" ", flush=True)
-    t0 = time.time()
 
+def procesar_archivo(s3_key: str, year_month: str) -> pd.DataFrame:
+    """Lee un solo archivo parquet desde S3 y extrae carriers."""
+    s3 = boto3.client("s3")
     try:
-        # Leer solo header y data — mucho más rápido
-        df = pd.read_parquet(s3_path, columns=["header", "data"])
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        buf = BytesIO(obj["Body"].read())
+        df = pd.read_parquet(buf, columns=["header", "data"])
+        buf.close()
     except Exception as e:
-        print(f"ERROR: {e}", flush=True)
+        print(f"    ERROR leyendo {s3_key}: {e}", flush=True)
         return pd.DataFrame()
 
     if len(df) == 0:
-        print("0 filas", flush=True)
         return pd.DataFrame()
 
-    # Extraer event_type y order_id del header en un solo pass
+    # Parsear header
     def parse_header(h):
         try:
             d = json.loads(h) if isinstance(h, str) else h
@@ -98,28 +100,25 @@ def procesar_mes(year_month_short: str) -> pd.DataFrame:
             return "", ""
 
     parsed = df["header"].apply(parse_header)
-    df["event_type"]         = parsed.apply(lambda x: x[0])
-    df["logistic_order_id"]  = parsed.apply(lambda x: x[1])
+    df["event_type"]        = parsed.apply(lambda x: x[0])
+    df["logistic_order_id"] = parsed.apply(lambda x: x[1])
 
-    # Filtrar solo el event type con carrier
+    # Filtrar event type
     df = df[df["event_type"] == EVENT_TYPE].copy()
-
     if len(df) == 0:
-        print("0 eventos con carrier", flush=True)
+        del df; gc.collect()
         return pd.DataFrame()
 
-    print(f"{len(df):,} eventos → extrayendo carrier...", end=" ", flush=True)
-
-    # Extraer carrier vectorizado
+    # Extraer carrier
     carrier_parsed = df["data"].apply(extraer_carrier_json)
     df["carrier_code"] = carrier_parsed.apply(lambda x: x[0])
     df["carrier_name"] = carrier_parsed.apply(lambda x: x[1])
     df["year_month"]   = year_month
 
-    # Una fila por orden con el carrier más frecuente
-    df_valid = df[df["carrier_code"].notna() & (df["logistic_order_id"] != "")]
+    df_valid = df[df["carrier_code"].notna() & (df["logistic_order_id"] != "")].copy()
+    del df; gc.collect()
+
     if len(df_valid) == 0:
-        print("0 con carrier", flush=True)
         return pd.DataFrame()
 
     result = (
@@ -128,25 +127,19 @@ def procesar_mes(year_month_short: str) -> pd.DataFrame:
         .agg(
             carrier_code=("carrier_code", lambda x: x.value_counts().index[0]),
             carrier_name=("carrier_name", "first"),
-            year_month=("year_month",   "first"),
+            year_month  =("year_month",   "first"),
         )
         .reset_index()
     )
-
-    elapsed = time.time() - t0
-    print(f"{len(result):,} ordenes en {elapsed:.0f}s", flush=True)
-
-    del df, df_valid; gc.collect()
+    del df_valid; gc.collect()
     return result
 
 
 def insertar_en_rds(df: pd.DataFrame):
-    """Inserta un DataFrame en stg_carrier ignorando duplicados."""
     if len(df) == 0:
         return 0
     try:
         eng = get_engine()
-        # Usar INSERT ON CONFLICT DO NOTHING via SQL para no duplicar
         records = df.to_dict("records")
         with eng.connect() as conn:
             for i in range(0, len(records), 5000):
@@ -165,16 +158,61 @@ def insertar_en_rds(df: pd.DataFrame):
         return 0
 
 
+def procesar_mes(mes: str) -> int:
+    year_month = f"{mes[:4]}-{mes[4:]}"
+    print(f"\n  [{mes}] Listando archivos S3...", flush=True)
+
+    archivos = listar_archivos_s3(mes)
+    if not archivos:
+        print(f"  [{mes}] Sin archivos", flush=True)
+        return 0
+
+    print(f"  [{mes}] {len(archivos)} archivos — procesando uno por uno...", flush=True)
+    total_mes = 0
+    dfs = []
+
+    for i, key in enumerate(archivos, 1):
+        print(f"    [{mes}] archivo {i}/{len(archivos)}...", end=" ", flush=True)
+        t0 = time.time()
+        df = procesar_archivo(key, year_month)
+        elapsed = time.time() - t0
+        if len(df) > 0:
+            dfs.append(df)
+            print(f"{len(df):,} ordenes en {elapsed:.0f}s", flush=True)
+        else:
+            print(f"0 ordenes en {elapsed:.0f}s", flush=True)
+
+    if dfs:
+        df_mes = pd.concat(dfs, ignore_index=True)
+        del dfs; gc.collect()
+
+        # Deduplicar dentro del mes
+        df_mes = (
+            df_mes.groupby("logistic_order_id")
+            .agg(
+                carrier_code=("carrier_code", lambda x: x.value_counts().index[0]),
+                carrier_name=("carrier_name", "first"),
+                year_month  =("year_month",   "first"),
+            )
+            .reset_index()
+        )
+        n = insertar_en_rds(df_mes)
+        total_mes = n
+        print(f"  [{mes}] ✓ {n:,} órdenes insertadas en RDS", flush=True)
+        del df_mes; gc.collect()
+
+    return total_mes
+
+
 def main():
     t_inicio = time.time()
     print("="*60, flush=True)
-    print("EXTRACTOR CARRIER S3 → RDS (optimizado)", flush=True)
-    print(f"Meses: {len(MESES)} | Paralelo: 3 simultáneos", flush=True)
+    print("EXTRACTOR CARRIER S3 → RDS (v2 - archivo por archivo)", flush=True)
+    print(f"Meses: {len(MESES)} | Secuencial (bajo uso de memoria)", flush=True)
     print("="*60, flush=True)
 
     crear_tabla()
 
-    # Verificar si hay datos
     engine = get_engine()
     with engine.connect() as conn:
         n_exist = conn.execute(text(
@@ -184,33 +222,16 @@ def main():
 
     if n_exist > 0:
         print(f"\nYa hay {n_exist:,} filas en stg_carrier.", flush=True)
-        resp = input("¿Truncar y recargar? (s/n): ").strip().lower()
-        if resp == "s":
-            eng = get_engine()
-            with eng.connect() as conn:
-                conn.execute(text("TRUNCATE staging_marts.stg_carrier"))
-                conn.commit()
-            eng.dispose()
-        else:
-            print("Carga cancelada.", flush=True)
-            return
+        print("Truncando y recargando...", flush=True)
+        eng = get_engine()
+        with eng.connect() as conn:
+            conn.execute(text("TRUNCATE staging_marts.stg_carrier"))
+            conn.commit()
+        eng.dispose()
 
-    # Procesar en paralelo — 3 meses a la vez
-    print(f"\nProcesando {len(MESES)} meses en paralelo...", flush=True)
     total = 0
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(procesar_mes, mes): mes for mes in MESES}
-        for future in as_completed(futures):
-            mes = futures[future]
-            try:
-                df_carrier = future.result()
-                if len(df_carrier) > 0:
-                    n = insertar_en_rds(df_carrier)
-                    total += n
-                    print(f"  [{mes}] insertadas {n:,} en RDS", flush=True)
-            except Exception as e:
-                print(f"  [{mes}] ERROR: {e}", flush=True)
+    for mes in MESES:
+        total += procesar_mes(mes)
 
     # Resumen final
     print(f"\n{'='*60}", flush=True)
@@ -234,4 +255,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()  
