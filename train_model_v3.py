@@ -1,27 +1,22 @@
 """
-Entrenamiento modelo LightGBM v3 — con carrier y features de flujo.
+Entrenamiento modelo LightGBM v3 — carrier directo desde S3.
 
-Mejoras respecto al v2:
-  - carrier_code: transportista asignado (BKSM, BLUEEXPRESS, IBIS, etc.)
-  - n_eventos: cantidad de eventos del paquete
-  - n_estados_distintos: cuántos estados atravesó
-  - tuvo_delivery_attempted: intento fallido de entrega
-  - tuvo_exception: excepción en el ciclo
-  - tuvo_annulled: orden anulada
-  - horas_max_gap: mayor tiempo sin actividad (impasse)
-  - horas_ultimo_evento: tiempo total del ciclo de eventos
+Lee el carrier desde los parquet crudos de S3 en lugar de RDS.
+Filtra solo Chile (country=CL) y solo eventos STATE_CHANGED.
+Une con ml_dataset_v2 de RDS en memoria.
 
-Dataset: staging_marts.ml_dataset_v3
-Split:   temporal (train=2025-01/11, val=2025-12/2026-01, test=2026-02)
+Ventajas:
+  - No necesita cargar stg_carrier a RDS
+  - Filtro de país garantizado
+  - Más rápido de implementar
 
 Uso:
-    python3 train_model_v3.py
+    python3 train_model_v3_s3.py
 
 Outputs en ml_outputs/:
     model_lgbm_v3.pkl
     results_v3.json
     feature_importance_v3.csv
-    comparacion_v1_v2_v3.json
 """
 
 import os, gc, json, time, pickle, warnings
@@ -34,6 +29,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 from sklearn.metrics import roc_auc_score, classification_report
 from sklearn.preprocessing import LabelEncoder
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore")
 load_dotenv("/home/ec2-user/Inicio_falabella/.env")
@@ -41,10 +37,25 @@ load_dotenv("/home/ec2-user/Inicio_falabella/.env")
 OUTPUT_DIR = Path("/home/ec2-user/Inicio_falabella/ml_outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+S3_BASE    = "s3://falabella-data"
+EVENT_TYPE = "FULFILMENT_ORDER_ITEM_QUANTITY_STATE_CHANGED"
+
+MESES_S3 = [
+    "202501","202502","202503","202504","202505","202506",
+    "202507","202508","202509","202510","202511","202512",
+    "202601","202602"
+]
+
+MESES_TRAIN = [
+    "2025-01","2025-02","2025-03","2025-04","2025-05","2025-06",
+    "2025-07","2025-08","2025-09","2025-10","2025-11"
+]
+MESES_VAL  = ["2025-12","2026-01"]
+MESES_TEST = ["2026-02"]
+
 # ── Features ─────────────────────────────────────────────────────────────────
 
 FEATURES_NUMERICAS = [
-    # originales v1
     "is_click_and_collect",
     "is_high_season",
     "has_insurance",
@@ -54,40 +65,22 @@ FEATURES_NUMERICAS = [
     "hora_creacion",
     "dia_mes_creacion",
     "sla_horas_prometidas",
-    # features históricas v2
     "seller_n_ordenes",
     "seller_tasa_disrupcion",
     "categoria_tasa_disrupcion",
     "categoria_cac_tasa_disrupcion",
     "dia_semana_tasa_disrupcion",
     "franja_tasa_disrupcion",
-    # features de flujo v3
-    "n_eventos",
-    "n_estados_distintos",
-    "tuvo_delivery_attempted",
-    "tuvo_exception",
-    "tuvo_annulled",
-    "horas_primer_evento",
-    "horas_ultimo_evento",
-    "horas_max_gap",
-    "ciclo_completo",
 ]
 
 FEATURES_CATEGORICAS = [
     "service_category",
     "franja_horaria",
-    "carrier_code",       # nuevo v3
+    "carrier_code",
 ]
 
 ALL_FEATURES = FEATURES_NUMERICAS + FEATURES_CATEGORICAS
 TARGET       = "target_binario"
-
-MESES_TRAIN = [
-    "2025-01","2025-02","2025-03","2025-04","2025-05","2025-06",
-    "2025-07","2025-08","2025-09","2025-10","2025-11"
-]
-MESES_VAL  = ["2025-12","2026-01"]
-MESES_TEST = ["2026-02"]
 
 PARAMS_LGBM = {
     "objective":         "binary",
@@ -116,14 +109,139 @@ def get_engine():
     return create_engine(url, pool_pre_ping=True, pool_recycle=60)
 
 
-def cargar_mes(year_month: str, encoders: dict, fit: bool = False):
+# ── Extracción de carrier desde S3 ───────────────────────────────────────────
+
+def extraer_carrier_mes(mes_short: str) -> pd.DataFrame:
+    """
+    Lee un mes desde S3, filtra CL + STATE_CHANGED y extrae carrier.
+    Devuelve DataFrame con logistic_order_id y carrier_code.
+    """
+    s3_path = f"{S3_BASE}/{mes_short}/"
+    year_month = f"{mes_short[:4]}-{mes_short[4:]}"
+
+    try:
+        df = pd.read_parquet(s3_path, columns=["header", "data"])
+    except Exception as e:
+        print(f"    [{year_month}] ERROR S3: {e}", flush=True)
+        return pd.DataFrame(columns=["logistic_order_id", "carrier_code"])
+
+    if len(df) == 0:
+        return pd.DataFrame(columns=["logistic_order_id", "carrier_code"])
+
+    # Parsear header
+    def parse_header(h):
+        try:
+            d = json.loads(h) if isinstance(h, str) else h
+            return (
+                d.get("eventType", ""),
+                d.get("logisticOrderId", ""),
+                d.get("country", "")
+            )
+        except:
+            return ("", "", "")
+
+    parsed = df["header"].apply(parse_header)
+    df["event_type"]        = parsed.apply(lambda x: x[0])
+    df["logistic_order_id"] = parsed.apply(lambda x: x[1])
+    df["country"]           = parsed.apply(lambda x: x[2])
+
+    # Filtrar solo CL + STATE_CHANGED
+    df = df[
+        (df["country"] == "CL") &
+        (df["event_type"] == EVENT_TYPE)
+    ].copy()
+
+    if len(df) == 0:
+        return pd.DataFrame(columns=["logistic_order_id", "carrier_code"])
+
+    # Extraer carrier del JSON data
+    def get_carrier(data_str):
+        try:
+            data = json.loads(data_str) if isinstance(data_str, str) else data_str
+            for item in data.get("orderItems", []):
+                for state in item.get("states", []):
+                    for pkg in state.get("packagesInfo", []):
+                        td = pkg.get("trackingData", {})
+                        code = td.get("carrierCode", "")
+                        if code and code.strip():
+                            return code.strip()
+        except:
+            pass
+        return None
+
+    df["carrier_code"] = df["data"].apply(get_carrier)
+
+    # Una fila por orden — carrier más frecuente
+    result = (
+        df[df["carrier_code"].notna() & (df["logistic_order_id"] != "")]
+        .groupby("logistic_order_id")["carrier_code"]
+        .agg(lambda x: x.value_counts().index[0])
+        .reset_index()
+    )
+
+    del df; gc.collect()
+    print(f"    [{year_month}] {len(result):,} órdenes con carrier CL", flush=True)
+    return result
+
+
+def cargar_todos_los_carriers() -> pd.DataFrame:
+    """
+    Carga carriers de todos los meses desde S3 en paralelo (4 workers).
+    Devuelve un DataFrame con logistic_order_id y carrier_code.
+    """
+    print("\n[PRE] Extrayendo carriers desde S3 (4 workers en paralelo)...", flush=True)
+    t0 = time.time()
+
+    frames = []
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(extraer_carrier_mes, mes): mes for mes in MESES_S3}
+        for future in as_completed(futures):
+            try:
+                df = future.result()
+                if len(df) > 0:
+                    frames.append(df)
+            except Exception as e:
+                print(f"    ERROR: {e}", flush=True)
+
+    if not frames:
+        print("  Sin carriers encontrados — usando DESCONOCIDO para todos", flush=True)
+        return pd.DataFrame(columns=["logistic_order_id", "carrier_code"])
+
+    carriers = pd.concat(frames, ignore_index=True)
+
+    # Si una orden aparece en varios meses, tomar el más frecuente
+    carriers = (
+        carriers.groupby("logistic_order_id")["carrier_code"]
+        .agg(lambda x: x.value_counts().index[0])
+        .reset_index()
+    )
+
+    print(f"\n  Total órdenes con carrier: {len(carriers):,}", flush=True)
+    print(f"  Top carriers:", flush=True)
+    print(carriers["carrier_code"].value_counts().head(10).to_string(), flush=True)
+    print(f"  Tiempo: {(time.time()-t0)/60:.1f} minutos", flush=True)
+
+    del frames; gc.collect()
+    return carriers
+
+
+# ── Carga de datos desde RDS ──────────────────────────────────────────────────
+
+def cargar_mes_rds(year_month: str, carriers_df: pd.DataFrame,
+                   encoders: dict, fit: bool = False):
+    """
+    Carga un mes desde ml_dataset_v2 en RDS y une con carriers.
+    """
     print(f"    {year_month}...", end=" ", flush=True)
     t0 = time.time()
 
-    cols = ", ".join(ALL_FEATURES + [TARGET])
+    # Columnas del v2 (sin carrier_code)
+    cols_v2 = FEATURES_NUMERICAS + ["service_category", "franja_horaria", TARGET]
+    cols_sql = ", ".join(cols_v2)
+
     query = text(f"""
-        SELECT {cols}
-        FROM staging_marts.ml_dataset_v3
+        SELECT logistic_order_id, {cols_sql}
+        FROM staging_marts.ml_dataset_v2
         WHERE year_month = :ym
     """)
 
@@ -143,6 +261,10 @@ def cargar_mes(year_month: str, encoders: dict, fit: bool = False):
     if len(df) == 0:
         print("0 filas", flush=True)
         return None, None, encoders
+
+    # JOIN con carriers en memoria
+    df = df.merge(carriers_df, on="logistic_order_id", how="left")
+    df["carrier_code"] = df["carrier_code"].fillna("DESCONOCIDO")
 
     # Numéricas
     for col in FEATURES_NUMERICAS:
@@ -169,17 +291,23 @@ def cargar_mes(year_month: str, encoders: dict, fit: bool = False):
     X = df[ALL_FEATURES].values.astype("float32")
     y = df[TARGET].astype("int32").values
 
+    # Info de cobertura de carrier
+    n_con_carrier = (df["carrier_code"] != 0).sum() if "carrier_code" in df.columns else 0
+    pct = 100 * (df["carrier_code"].astype(str) != str(encoders.get("carrier_code",
+          type("", (), {"transform": lambda self, x: [0]})()).transform(["DESCONOCIDO"])[0]
+          )).mean() if "carrier_code" in encoders else 0
+
     del df; gc.collect()
     print(f"{len(y):,} filas en {time.time()-t0:.0f}s", flush=True)
     return X, y, encoders
 
 
-def cargar_split(meses, encoders, fit=False, nombre=""):
+def cargar_split(meses, carriers_df, encoders, fit=False, nombre=""):
     print(f"  Cargando {nombre} ({len(meses)} meses)...", flush=True)
     Xs, ys = [], []
     first = fit
     for mes in meses:
-        X, y, encoders = cargar_mes(mes, encoders, fit=first)
+        X, y, encoders = cargar_mes_rds(mes, carriers_df, encoders, fit=first)
         if X is not None:
             Xs.append(X)
             ys.append(y)
@@ -220,61 +348,31 @@ def evaluar(model, X, y, split_name):
     }
 
 
-def comparar_modelos(m_val, m_test):
-    print(f"\n{'='*55}", flush=True)
-    print("COMPARACIÓN v1 / v2 / v3", flush=True)
-    print(f"{'='*55}", flush=True)
-
-    resultados = {}
-
-    for path, nombre in [
-        (OUTPUT_DIR / "results_v1.json", "v1"),
-        (OUTPUT_DIR / "results_v2.json", "v2"),
-    ]:
-        if path.exists():
-            with open(path) as f:
-                r = json.load(f)
-            resultados[nombre] = r
-
-    header = f"{'Modelo':<8} {'AUC val':>10} {'F1 val':>10} {'AUC test':>10} {'F1 test':>10}"
-    print(header, flush=True)
-    print("-"*55, flush=True)
-
-    for nombre, r in resultados.items():
-        print(f"  {nombre:<6} {r['val']['auc_roc']:>10} {r['val']['f1_disrupted']:>10} "
-              f"{r['test']['auc_roc']:>10} {r['test']['f1_disrupted']:>10}", flush=True)
-
-    print(f"  {'v3':<6} {m_val['auc_roc']:>10} {m_val['f1_disrupted']:>10} "
-          f"{m_test['auc_roc']:>10} {m_test['f1_disrupted']:>10}", flush=True)
-
-    # Guardar comparación
-    resultados["v3"] = {"val": m_val, "test": m_test}
-    with open(OUTPUT_DIR / "comparacion_v1_v2_v3.json", "w") as f:
-        json.dump(resultados, f, indent=2)
-
-
 def main():
     t_inicio = time.time()
     print("="*60, flush=True)
-    print("ENTRENAMIENTO LGBM v3 — con carrier + flujo", flush=True)
-    print(f"Features: {len(ALL_FEATURES)} total", flush=True)
-    print(f"  Nuevas vs v2: carrier_code, n_eventos, tuvo_exception,", flush=True)
-    print(f"                tuvo_delivery_attempted, horas_max_gap", flush=True)
+    print("ENTRENAMIENTO LGBM v3 — carrier directo desde S3", flush=True)
+    print(f"Features: {len(ALL_FEATURES)} | Carrier filtrado: country=CL", flush=True)
     print("="*60, flush=True)
+
+    # ── PRE: Extraer carriers desde S3 ──────────────────────────
+    carriers_df = cargar_todos_los_carriers()
 
     encoders = {}
 
-    # ── 1. Cargar ────────────────────────────────────────────────
-    print("\n[1/4] Cargando desde ml_dataset_v3...", flush=True)
+    # ── 1. Cargar datos desde RDS + JOIN carrier en memoria ──────
+    print("\n[1/4] Cargando desde ml_dataset_v2 + carrier...", flush=True)
     X_train, y_train, encoders = cargar_split(
-        MESES_TRAIN, encoders, fit=True, nombre="train"
+        MESES_TRAIN, carriers_df, encoders, fit=True, nombre="train"
     )
     X_val,   y_val,   encoders = cargar_split(
-        MESES_VAL, encoders, fit=False, nombre="val"
+        MESES_VAL, carriers_df, encoders, fit=False, nombre="val"
     )
     X_test,  y_test,  encoders = cargar_split(
-        MESES_TEST, encoders, fit=False, nombre="test"
+        MESES_TEST, carriers_df, encoders, fit=False, nombre="test"
     )
+
+    del carriers_df; gc.collect()
 
     # ── 2. Datasets LightGBM ─────────────────────────────────────
     print("\n[2/4] Construyendo datasets...", flush=True)
@@ -314,16 +412,26 @@ def main():
     print("\n[4/4] Evaluando...", flush=True)
     m_val  = evaluar(model, X_val,  y_val,  "val")
     m_test = evaluar(model, X_test, y_test, "test")
-    comparar_modelos(m_val, m_test)
+
+    # Comparar con versiones anteriores
+    print(f"\n{'='*55}", flush=True)
+    print("COMPARACIÓN v1 / v2 / v3", flush=True)
+    print(f"{'Modelo':<8} {'AUC val':>10} {'F1 val':>10} {'AUC test':>10}", flush=True)
+    print("-"*45, flush=True)
+    for nombre, path in [("v1", "results_v1.json"), ("v2", "results_v2.json")]:
+        p = OUTPUT_DIR / path
+        if p.exists():
+            r = json.load(open(p))
+            print(f"  {nombre:<6} {r['val']['auc_roc']:>10} "
+                  f"{r['val']['f1_disrupted']:>10} {r['test']['auc_roc']:>10}", flush=True)
+    print(f"  {'v3':<6} {m_val['auc_roc']:>10} "
+          f"{m_val['f1_disrupted']:>10} {m_test['auc_roc']:>10}", flush=True)
 
     # ── Guardar ──────────────────────────────────────────────────
-    model_path = OUTPUT_DIR / "model_lgbm_v3.pkl"
-    with open(model_path, "wb") as f:
+    with open(OUTPUT_DIR / "model_lgbm_v3.pkl", "wb") as f:
         pickle.dump({
-            "model":    model,
-            "encoders": encoders,
-            "features": ALL_FEATURES,
-            "version":  "v3",
+            "model": model, "encoders": encoders,
+            "features": ALL_FEATURES, "version": "v3",
         }, f)
 
     with open(OUTPUT_DIR / "results_v3.json", "w") as f:
@@ -351,4 +459,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  
+    main() 
