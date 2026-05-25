@@ -2,18 +2,17 @@
 Carga event_packages desde S3 a RDS PostgreSQL.
 
 Lee los archivos Parquet de S3 mes a mes y los inserta en
-staging_marts.stg_event_packages.
+staging_marts.stg_event_packages en partes (row groups) para no saturar la RAM.
 
 Uso:
     python3 cargar_event_packages.py
-
-Tiempo estimado: 20-40 minutos (7.2 GB)
 """
 
 import os, gc, time, warnings, io
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import s3fs
 from dotenv import load_dotenv
 from pathlib import Path
 from sqlalchemy import create_engine, text
@@ -28,6 +27,11 @@ MESES = [
 ]
 
 S3_BASE = "s3://falabella-data/processed/event_packages/country=CL"
+COLS = [
+    "logistic_order_id", "event_type", "event_dt", "country",
+    "shipment_id", "package_id", "promised_date", "carrier",
+    "tracking_number", "package_status", "year_month",
+]
 
 
 def get_engine():
@@ -78,34 +82,31 @@ def crear_indices(engine):
     print("  Índices creados OK", flush=True)
 
 
-COLS = [
-    "logistic_order_id", "event_type", "event_dt", "country",
-    "shipment_id", "package_id", "promised_date", "carrier",
-    "tracking_number", "package_status", "year_month",
-]
+def stream_parquet_safe(fpath: str, fs) -> pd.DataFrame:
+    """
+    Generador que lee un archivo parquet por partes (Row Groups) desde S3.
+    Esto evita cargar archivos gigantescos enteros a la memoria RAM.
+    """
+    pf = pq.ParquetFile(fpath, filesystem=fs)
+    for i in range(pf.metadata.num_row_groups):
+        t = pf.read_row_group(i)
+        # Normalización de compatibilidad de esquemas
+        for name in t.schema.names:
+            col = t.column(name)
+            if pa.types.is_dictionary(col.type):
+                t = t.set_column(t.schema.get_field_index(name), name, col.cast(pa.string()))
+        
+        df = t.to_pandas()
+        yield df
+        
+        # Forzar liberación de memoria del bloque procesado
+        del t, df
+        gc.collect()
 
 
-def read_parquet_safe(fpath: str) -> pd.DataFrame:
-    """Lee un parquet tolerando columnas con schema incompatible (string vs dictionary)."""
-    try:
-        return pd.read_parquet(fpath)
-    except Exception:
-        pf = pq.ParquetFile(fpath)
-        frames = []
-        for i in range(pf.metadata.num_row_groups):
-            t = pf.read_row_group(i)
-            for name in t.schema.names:
-                col = t.column(name)
-                if pa.types.is_dictionary(col.type):
-                    t = t.set_column(t.schema.get_field_index(name), name, col.cast(pa.string()))
-            frames.append(t.to_pandas())
-        return pd.concat(frames, ignore_index=True)
-
-
-def copy_df_to_rds(df):
-    """Inserta un DataFrame en RDS via COPY."""
-    eng = get_engine()
-    raw_conn = eng.raw_connection()
+def copy_df_to_rds(df, engine):
+    """Inserta un DataFrame en RDS vía COPY utilizando el engine existente."""
+    raw_conn = engine.raw_connection()
     try:
         cursor = raw_conn.cursor()
         buf = io.StringIO()
@@ -119,17 +120,13 @@ def copy_df_to_rds(df):
         cursor.close()
     finally:
         raw_conn.close()
-    eng.dispose()
 
 
-def cargar_mes(year_month: str) -> int:
-    """Lee un mes archivo por archivo desde S3 para no saturar RAM."""
-    import s3fs
-
+def cargar_mes(year_month: str, engine, fs) -> int:
+    """Lee un mes desde S3 procesando los archivos en partes (row groups)."""
     s3_path = f"{S3_BASE}/year_month={year_month}/"
     t0 = time.time()
 
-    fs = s3fs.S3FileSystem()
     bucket_prefix = s3_path.replace("s3://", "")
     try:
         archivos = sorted([f"s3://{f}" for f in fs.glob(f"{bucket_prefix}*.parquet")])
@@ -141,25 +138,29 @@ def cargar_mes(year_month: str) -> int:
         print(f"  {year_month} 0 archivos", flush=True)
         return 0
 
-    print(f"  {year_month} — {len(archivos)} archivos", flush=True)
+    print(f"  {year_month} — {len(archivos)} archivos (procesando por partes)", flush=True)
     total = 0
 
     for i, fpath in enumerate(archivos, 1):
         try:
-            df = read_parquet_safe(fpath)
+            # En lugar de leer todo el archivo, iteramos sobre sus partes (row groups)
+            for df_chunk in stream_parquet_safe(fpath, fs):
+                df_chunk["year_month"] = year_month
+                if "event_dt" in df_chunk.columns:
+                    df_chunk["event_dt"] = pd.to_datetime(df_chunk["event_dt"], errors="coerce")
+                df_chunk = df_chunk.reindex(columns=COLS)
+
+                copy_df_to_rds(df_chunk, engine)
+                total += len(df_chunk)
+                
+                del df_chunk
+                gc.collect()
+                
         except Exception as e:
             print(f"    [{i}/{len(archivos)}] ERROR: {e}", flush=True)
             continue
 
-        df["year_month"] = year_month
-        if "event_dt" in df.columns:
-            df["event_dt"] = pd.to_datetime(df["event_dt"], errors="coerce")
-        df = df.reindex(columns=COLS)
-
-        copy_df_to_rds(df)
-        total += len(df)
-        del df; gc.collect()
-        print(f"    [{i}/{len(archivos)}] {total:,} filas  {time.time()-t0:.0f}s", flush=True)
+        print(f"    [{i}/{len(archivos)}] {total:,} filas procesadas  {time.time()-t0:.0f}s", flush=True)
 
     print(f"  {year_month} LISTO: {total:,} filas en {time.time()-t0:.0f}s", flush=True)
     return total
@@ -182,26 +183,16 @@ def verificar_carga(engine):
         df = pd.read_sql(q, conn)
     print(df.to_string(index=False), flush=True)
 
-    q2 = text("""
-        SELECT package_status, COUNT(*) AS n
-        FROM staging_marts.stg_event_packages
-        GROUP BY package_status
-        ORDER BY n DESC
-    """)
-    with engine.connect() as conn:
-        df2 = pd.read_sql(q2, conn)
-    print("\nEstados disponibles:", flush=True)
-    print(df2.to_string(index=False), flush=True)
-
 
 def main():
     t_inicio = time.time()
     print("="*60, flush=True)
-    print("CARGA event_packages S3 → RDS", flush=True)
+    print("CARGA OPTIMIZADA event_packages S3 → RDS (Bajo Consumo de RAM)", flush=True)
     print(f"Meses: {len(MESES)} | Tamaño estimado: 7.2 GB", flush=True)
     print("="*60, flush=True)
 
     engine = get_engine()
+    fs = s3fs.S3FileSystem()
 
     # Crear tabla
     crear_tabla(engine)
@@ -231,7 +222,7 @@ def main():
     print(f"\nCargando {len(meses_pendientes)} meses pendientes desde S3...", flush=True)
     total_filas = 0
     for mes in meses_pendientes:
-        n = cargar_mes(mes)
+        n = cargar_mes(mes, engine, fs)
         total_filas += n
         gc.collect()
 
@@ -246,7 +237,6 @@ def main():
     print(f"CARGA COMPLETADA", flush=True)
     print(f"  Total filas:   {total_filas:,}", flush=True)
     print(f"  Tiempo total:  {total:.1f} minutos", flush=True)
-    print(f"  Tabla:         staging_marts.stg_event_packages", flush=True)
 
 
 if __name__ == "__main__":
