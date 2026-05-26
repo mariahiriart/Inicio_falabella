@@ -577,7 +577,9 @@ Si el usuario pregunta sobre el historial de un seller, usás consultar_historic
 Si pregunta dónde suelen fallar las órdenes, usás consultar_tramo_historico.
 Si el usuario pregunta por el recorrido, tracking, estados o eventos de una orden específica,
 usás consultar_recorrido_orden con el logistic_order_id que mencione.
-Si el usuario pregunta por datos completos de una orden específica por ID, usás buscar_orden_por_id.
+Si el usuario pregunta por los datos, metadatos, seller, categoría o información
+de una orden específica por ID, usás buscar_orden_por_id para obtener toda
+esa información directamente desde la base de datos histórica.
 
 Cuando una herramienta devuelve {"encontrado": false} o un campo "mensaje" indicando que no hay datos,
 respondé con claridad: "La orden X no existe en nuestro sistema o no tiene registros disponibles."
