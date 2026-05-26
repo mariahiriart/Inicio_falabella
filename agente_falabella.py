@@ -722,7 +722,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\"¿Dónde falla normalmente SCE3622?\"\n\n"
         "Escribime en lenguaje natural, no necesitás saber ningún formato especial 🚀"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,7 +730,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     historiales[user_id] = []
     await update.message.reply_text(
         "🔄 Conversación reiniciada. ¿En qué te puedo ayudar?",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
@@ -754,7 +754,7 @@ async def cmd_ejemplo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "```\n\n"
         "Usá /reset para empezar una conversación nueva."
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -789,16 +789,16 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(respuesta) > 4000:
             partes = [respuesta[i:i+4000] for i in range(0, len(respuesta), 4000)]
             for parte in partes:
-                await update.message.reply_text(parte, parse_mode="Markdown")
+                await update.message.reply_text(parte, parse_mode="HTML")
         else:
-            await update.message.reply_text(respuesta, parse_mode="Markdown")
+            await update.message.reply_text(respuesta, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Error procesando mensaje: {e}")
         await update.message.reply_text(
             "❌ Hubo un error procesando tu mensaje. "
             "Intentá de nuevo o usá /reset para reiniciar.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 
