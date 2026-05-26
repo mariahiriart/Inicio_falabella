@@ -594,6 +594,14 @@ async def handle_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Mensaje de {username} ({user_id}): {mensaje[:100]}")
 
+    # Si el mensaje parece una nueva orden, limpiar historial automáticamente
+    keywords_nueva_orden = ["tengo una orden", "nueva orden", "orden nueva",
+                            "tengo orden", "ingreso orden", "creada hoy",
+                            "creada hace", "sla ", "items, creada"]
+    if any(kw in mensaje.lower() for kw in keywords_nueva_orden):
+        historiales[user_id] = []
+        logger.info(f"Historial limpiado automáticamente para nueva orden")
+
     # Indicador de escritura
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
