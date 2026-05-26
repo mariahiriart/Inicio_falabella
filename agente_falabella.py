@@ -5,6 +5,9 @@ Herramientas: modelo ML v2 + consultas RDS
 
 El agente entiende lenguaje natural, extrae los datos de la orden,
 busca el histórico en RDS y predice la disrupción con explicación.
+También puede consultar el recorrido completo de una orden específica
+usando su logistic_order_id, mostrando todos los eventos y estados
+por los que pasó la orden.
 
 Uso:
     pip3 install python-telegram-bot openai
@@ -15,7 +18,7 @@ Requiere:
     - .env con credenciales RDS y KIMI_API_KEY
 """
 
-import os, json, pickle, logging, warnings, re
+import os, json, pickle, logging, warnings
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -225,6 +228,49 @@ def buscar_tramo_historico(seller_id: str, service_category: str) -> dict:
     return {"tramos": [], "total_disrupciones": 0}
 
 
+def consultar_recorrido_orden(logistic_order_id: str) -> dict:
+    """Consulta el recorrido completo de una orden desde stg_event_packages."""
+    try:
+        engine = get_engine()
+        q = text("""
+            SELECT
+                package_status,
+                event_dt,
+                EXTRACT(EPOCH FROM (event_dt - LAG(event_dt) OVER (
+                    PARTITION BY logistic_order_id ORDER BY event_dt
+                ))) / 3600 AS horas_desde_evento_anterior
+            FROM staging_marts.stg_event_packages
+            WHERE logistic_order_id = :oid
+            ORDER BY event_dt
+        """)
+        with engine.connect() as conn:
+            df = pd.read_sql(q, conn, params={"oid": logistic_order_id})
+        engine.dispose()
+
+        if len(df) == 0:
+            return {"encontrado": False, "mensaje": f"No se encontraron eventos para la orden {logistic_order_id}"}
+
+        eventos = []
+        for _, row in df.iterrows():
+            eventos.append({
+                "estado": row["package_status"],
+                "fecha": str(row["event_dt"]),
+                "horas_desde_anterior": round(float(row["horas_desde_evento_anterior"]), 1) if row["horas_desde_evento_anterior"] else None
+            })
+
+        return {
+            "encontrado": True,
+            "logistic_order_id": logistic_order_id,
+            "n_eventos": len(eventos),
+            "primer_evento": eventos[0]["fecha"],
+            "ultimo_evento": eventos[-1]["fecha"],
+            "ultimo_estado": eventos[-1]["estado"],
+            "eventos": eventos
+        }
+    except Exception as e:
+        return {"encontrado": False, "error": str(e)}
+
+
 def predecir_orden(
     service_category: str,
     seller_id: str,
@@ -402,6 +448,27 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "consultar_recorrido_orden",
+            "description": (
+                "Consulta el recorrido completo de una orden específica: todos los estados y eventos "
+                "por los que pasó, con las fechas y tiempos entre cada estado. "
+                "Usar cuando el usuario pregunte por el tracking, recorrido, estados o eventos de una orden."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "logistic_order_id": {
+                        "type": "string",
+                        "description": "ID de la orden logística",
+                    },
+                },
+                "required": ["logistic_order_id"],
+            },
+        },
+    },
 ]
 
 
@@ -420,6 +487,9 @@ lenguaje natural, JSON, o una descripción), vos:
 
 Si el usuario pregunta sobre el historial de un seller, usás consultar_historico_seller.
 Si pregunta dónde suelen fallar las órdenes, usás consultar_tramo_historico.
+Si el usuario pregunta por el recorrido, tracking, estados o eventos de una orden específica,
+usás buscar_orden_por_id con el logistic_order_id que mencione.
+Si el usuario pregunta por datos de una orden específica por ID, usás buscar_orden_por_id.
 
 Respondés siempre en español, de forma concisa y con emojis para facilitar la lectura.
 Sos honesto sobre la confianza de la predicción cuando el seller es nuevo o desconocido.
