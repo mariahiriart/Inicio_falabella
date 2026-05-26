@@ -442,7 +442,7 @@ async def procesar_con_claude(mensaje: str, historial: list) -> str:
     """
     client = OpenAI(
         api_key=KIMI_KEY,
-        base_url="https://api.moonshot.cn/v1"
+        base_url="https://api.moonshot.ai/v1"
     )
 
     messages = (
@@ -454,7 +454,7 @@ async def procesar_con_claude(mensaje: str, historial: list) -> str:
     # Loop del agente — Kimi puede usar múltiples herramientas
     for _ in range(5):
         response = client.chat.completions.create(
-            model="moonshot-v1-32k",
+            model="kimi-k2.5",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
