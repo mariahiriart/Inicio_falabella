@@ -229,43 +229,59 @@ def buscar_tramo_historico(seller_id: str, service_category: str) -> dict:
 
 
 def consultar_recorrido_orden(logistic_order_id: str) -> dict:
-    """Consulta el recorrido completo de una orden desde stg_event_packages."""
+    """Consulta el recorrido completo de una orden agrupado por paquete."""
     try:
         engine = get_engine()
         q = text("""
             SELECT
+                package_id,
+                shipment_id,
+                promised_date,
                 package_status,
+                event_type,
                 event_dt,
                 EXTRACT(EPOCH FROM (event_dt - LAG(event_dt) OVER (
-                    PARTITION BY logistic_order_id ORDER BY event_dt
-                ))) / 3600 AS horas_desde_evento_anterior
+                    PARTITION BY logistic_order_id, package_id ORDER BY event_dt
+                ))) / 3600 AS horas_desde_anterior
             FROM staging_marts.stg_event_packages
             WHERE logistic_order_id = :oid
-            ORDER BY event_dt
+            ORDER BY package_id, event_dt
         """)
         with engine.connect() as conn:
             df = pd.read_sql(q, conn, params={"oid": logistic_order_id})
         engine.dispose()
 
         if len(df) == 0:
-            return {"encontrado": False, "mensaje": f"No se encontraron eventos para la orden {logistic_order_id}"}
+            return {"encontrado": False, "mensaje": f"No se encontraron eventos para {logistic_order_id}"}
 
-        eventos = []
+        paquetes = {}
         for _, row in df.iterrows():
-            eventos.append({
-                "estado": row["package_status"],
-                "fecha": str(row["event_dt"]),
-                "horas_desde_anterior": round(float(row["horas_desde_evento_anterior"]), 1) if row["horas_desde_evento_anterior"] else None
+            pkg_id = row["package_id"] or "SIN_PACKAGE_ID"
+            if pkg_id not in paquetes:
+                paquetes[pkg_id] = {
+                    "package_id":    pkg_id,
+                    "shipment_id":   row["shipment_id"],
+                    "promised_date": str(row["promised_date"]) if row["promised_date"] else None,
+                    "eventos":       [],
+                    "ultimo_estado": None,
+                    "horas_max_gap": 0,
+                }
+            gap = float(row["horas_desde_anterior"]) if row["horas_desde_anterior"] and not pd.isna(row["horas_desde_anterior"]) else None
+            paquetes[pkg_id]["eventos"].append({
+                "fecha":                str(row["event_dt"]),
+                "event_type":           row["event_type"],
+                "estado":               row["package_status"],
+                "horas_desde_anterior": round(gap, 1) if gap else None,
             })
+            paquetes[pkg_id]["ultimo_estado"] = row["package_status"]
+            if gap and gap > paquetes[pkg_id]["horas_max_gap"]:
+                paquetes[pkg_id]["horas_max_gap"] = round(gap, 1)
 
         return {
-            "encontrado": True,
+            "encontrado":        True,
             "logistic_order_id": logistic_order_id,
-            "n_eventos": len(eventos),
-            "primer_evento": eventos[0]["fecha"],
-            "ultimo_evento": eventos[-1]["fecha"],
-            "ultimo_estado": eventos[-1]["estado"],
-            "eventos": eventos
+            "n_paquetes":        len(paquetes),
+            "paquetes":          list(paquetes.values()),
         }
     except Exception as e:
         return {"encontrado": False, "error": str(e)}
