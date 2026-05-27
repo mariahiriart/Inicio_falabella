@@ -359,6 +359,60 @@ def buscar_orden_por_id(logistic_order_id: str) -> dict:
         return {"encontrado": False, "error": str(e)}
 
 
+def consultar_estadisticas_generales(consulta: str) -> dict:
+    """Consulta estadísticas agregadas del dataset."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            df_dia = pd.read_sql(text("""
+                SELECT
+                    dia_semana_creacion,
+                    ROUND(AVG(target_binario::numeric)*100, 2) as pct_disrupted,
+                    COUNT(*) as n_ordenes
+                FROM staging_marts.ml_dataset_v2
+                WHERE service_category = 'REGULAR'
+                GROUP BY dia_semana_creacion
+                ORDER BY pct_disrupted DESC
+            """), conn)
+
+            df_franja = pd.read_sql(text("""
+                SELECT
+                    franja_horaria,
+                    ROUND(AVG(d.target_binario::numeric)*100, 2) as pct_disrupted,
+                    COUNT(*) as n_ordenes
+                FROM staging_marts.ml_dataset_v2 d
+                WHERE service_category = 'REGULAR'
+                GROUP BY franja_horaria
+                ORDER BY pct_disrupted DESC
+            """), conn)
+
+        engine.dispose()
+
+        dias = {0: "Domingo", 1: "Lunes", 2: "Martes", 3: "Miércoles",
+                4: "Jueves",  5: "Viernes", 6: "Sábado"}
+
+        return {
+            "por_dia": [
+                {
+                    "dia": dias.get(int(row["dia_semana_creacion"]), str(row["dia_semana_creacion"])),
+                    "pct_disrupted": float(row["pct_disrupted"]),
+                    "n_ordenes": int(row["n_ordenes"])
+                }
+                for _, row in df_dia.iterrows()
+            ],
+            "por_franja": [
+                {
+                    "franja": row["franja_horaria"],
+                    "pct_disrupted": float(row["pct_disrupted"]),
+                    "n_ordenes": int(row["n_ordenes"])
+                }
+                for _, row in df_franja.iterrows()
+            ]
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def predecir_orden(
     service_category: str,
     seller_id: str,
@@ -557,6 +611,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "consultar_estadisticas_generales",
+            "description": (
+                "Consulta estadísticas agregadas del dataset — peor día de la semana, "
+                "peor franja horaria, patrones por categoría. "
+                "Usar cuando el usuario pregunte por patrones generales, "
+                "el peor día, la peor hora, o tendencias por categoría."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "consulta": {
+                        "type": "string",
+                        "description": "Descripción de qué estadística se quiere consultar",
+                    },
+                },
+                "required": ["consulta"],
+            },
+        },
+    },
 ]
 
 
@@ -672,6 +748,10 @@ async def procesar_con_claude(mensaje: str, historial: list) -> str:
             elif tool_name == "buscar_orden_por_id":
                 resultado = buscar_orden_por_id(
                     logistic_order_id = tool_input.get("logistic_order_id", ""),
+                )
+            elif tool_name == "consultar_estadisticas_generales":
+                resultado = consultar_estadisticas_generales(
+                    consulta = tool_input.get("consulta", ""),
                 )
             else:
                 resultado = {"error": f"Herramienta {tool_name} no encontrada"}
