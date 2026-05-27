@@ -700,7 +700,7 @@ async def procesar_con_claude(mensaje: str, historial: list) -> str:
             tools=TOOLS,
             tool_choice="auto",
             max_tokens=1000,
-            temperature=0.3,
+            temperature=1,
         )
 
         msg = response.choices[0].message
