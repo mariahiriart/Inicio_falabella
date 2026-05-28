@@ -429,6 +429,133 @@ def consultar_estadisticas_generales(consulta: str) -> dict:
         return {"error": str(e)}
 
 
+def predecir_con_itinerario(
+    service_category: str,
+    seller_id: str,
+    sla_horas: float,
+    created_at: str,
+    eventos: list
+) -> dict:
+    """
+    Predice el riesgo calculando features de flujo desde eventos reales.
+    eventos = [{"timestamp": "2025-06-05T20:08:00", "estado": "DELIVERY_ATTEMPTED"}, ...]
+    """
+    try:
+        tiempos = [datetime.fromisoformat(e["timestamp"].replace("Z", "")) for e in eventos]
+        estados = [e["estado"] for e in eventos]
+
+        gaps = []
+        for i in range(1, len(tiempos)):
+            gap = (tiempos[i] - tiempos[i-1]).total_seconds() / 3600
+            if gap >= 0:
+                gaps.append(gap)
+
+        horas_max_gap  = max(gaps) if gaps else 0
+        horas_avg_gap  = sum(gaps) / len(gaps) if gaps else 0
+        n_eventos      = len(eventos)
+        n_estados_dist = len(set(estados))
+
+        t0 = tiempos[0]
+        horas_a_ship = next(
+            ((tiempos[i] - t0).total_seconds() / 3600
+             for i, s in enumerate(estados) if s == "SHIPMENT_CONFIRMED"), -1
+        )
+        horas_a_otd = next(
+            ((tiempos[i] - t0).total_seconds() / 3600
+             for i, s in enumerate(estados) if s == "OUT_FOR_DELIVERY"), -1
+        )
+
+        tuvo_da  = int("DELIVERY_ATTEMPTED" in estados)
+        tuvo_exc = int("EXCEPTION" in estados)
+        tuvo_ann = int("ANNULLED" in estados)
+        ultimo   = estados[-1]
+
+        engine = get_engine()
+        q = text("""
+            SELECT AVG(h.seller_tasa_disrupcion)        AS seller_tasa,
+                   AVG(h.categoria_tasa_disrupcion)     AS cat_tasa,
+                   AVG(h.categoria_cac_tasa_disrupcion) AS cat_cac_tasa,
+                   AVG(h.dia_semana_tasa_disrupcion)    AS dia_tasa,
+                   AVG(h.franja_tasa_disrupcion)        AS franja_tasa,
+                   MAX(h.seller_n_ordenes)              AS seller_n_ordenes
+            FROM staging_marts.ml_historical_features h
+            JOIN staging_marts.ml_dataset_v1 d ON h.logistic_order_id = d.logistic_order_id
+            WHERE d.service_category = :cat
+            LIMIT 1
+        """)
+        with engine.connect() as conn:
+            hist = pd.read_sql(q, conn, params={"cat": service_category})
+        engine.dispose()
+        row = hist.iloc[0] if len(hist) > 0 else pd.Series()
+
+        dt = datetime.fromisoformat(created_at.replace("Z", "")) if created_at else datetime.now()
+        dia_semana = (dt.weekday() + 1) % 7
+        hora = dt.hour
+        franja = "manana" if 6 <= hora < 12 else "tarde" if 12 <= hora < 20 else "madrugada"
+
+        feature_map = {
+            "is_click_and_collect":          0.0,
+            "is_high_season":                1.0,
+            "has_insurance":                 1.0,
+            "total_items":                   1.0,
+            "distinct_skus":                 1.0,
+            "dia_semana_creacion":           float(dia_semana),
+            "hora_creacion":                 float(hora),
+            "dia_mes_creacion":              float(dt.day),
+            "sla_horas_prometidas":          float(sla_horas),
+            "seller_n_ordenes":              float(row.get("seller_n_ordenes", 0) or 0),
+            "seller_tasa_disrupcion":        float(row.get("seller_tasa", 0.4) or 0.4),
+            "categoria_tasa_disrupcion":     float(row.get("cat_tasa", 0.4) or 0.4),
+            "categoria_cac_tasa_disrupcion": float(row.get("cat_cac_tasa", 0.4) or 0.4),
+            "dia_semana_tasa_disrupcion":    float(row.get("dia_tasa", 0.4) or 0.4),
+            "franja_tasa_disrupcion":        float(row.get("franja_tasa", 0.4) or 0.4),
+            "horas_a_shipment_confirmed":    float(horas_a_ship),
+            "horas_a_out_for_delivery":      float(horas_a_otd),
+            "horas_entre_eventos_max":       float(horas_max_gap),
+            "horas_entre_eventos_avg":       float(horas_avg_gap),
+            "n_eventos_total":               float(n_eventos),
+            "n_estados_distintos":           float(n_estados_dist),
+            "tuvo_delivery_attempted":       float(tuvo_da),
+            "tuvo_exception":                float(tuvo_exc),
+            "tuvo_annulled":                 float(tuvo_ann),
+            "esta_en_transito":              float(1 if ultimo == "IN_TRANSIT" else 0),
+            "esta_out_for_delivery":         float(1 if ultimo == "OUT_FOR_DELIVERY" else 0),
+            "esta_shipment_confirmed":       float(1 if ultimo == "SHIPMENT_CONFIRMED" else 0),
+            "service_category":              service_category,
+            "franja_horaria":                franja,
+            "ultimo_estado":                 ultimo,
+        }
+
+        for col in ["service_category", "franja_horaria", "ultimo_estado"]:
+            if col in ENCODERS:
+                le  = ENCODERS[col]
+                val = feature_map[col]
+                if val not in le.classes_:
+                    val = "DESCONOCIDO"
+                feature_map[col] = int(le.transform([val])[0])
+            else:
+                feature_map[col] = 0
+
+        X    = np.array([[feature_map[f] for f in FEATURES]], dtype="float32")
+        prob = float(MODEL.predict(X)[0])
+
+        nivel = "CRÍTICO" if prob >= 0.8 else "ALTO" if prob >= 0.6 else "MODERADO" if prob >= 0.4 else "BAJO"
+
+        return {
+            "prob_disrupcion":         round(prob, 4),
+            "porcentaje":              round(prob * 100, 1),
+            "nivel_riesgo":            nivel,
+            "n_eventos_analizados":    n_eventos,
+            "horas_max_gap":           round(horas_max_gap, 1),
+            "tuvo_delivery_attempted": bool(tuvo_da),
+            "ultimo_estado":           ultimo,
+            "modelo":                  "Modelo D — AUC 0.9831",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def predecir_orden(
     service_category: str,
     seller_id: str,
@@ -649,6 +776,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "predecir_con_itinerario",
+            "description": (
+                "Predice el riesgo de disrupción usando el itinerario real de eventos de una orden. "
+                "Llamar cuando el usuario quiera saber el riesgo en un momento específico del recorrido "
+                "o cuando proporcione una secuencia de estados con timestamps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_category": {"type": "string"},
+                    "seller_id":        {"type": "string"},
+                    "sla_horas":        {"type": "number"},
+                    "created_at":       {"type": "string"},
+                    "eventos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "timestamp": {"type": "string"},
+                                "estado":    {"type": "string"},
+                            }
+                        }
+                    }
+                },
+                "required": ["service_category", "sla_horas", "eventos"],
+            },
+        },
+    },
 ]
 
 
@@ -768,6 +926,14 @@ async def procesar_con_claude(mensaje: str, historial: list) -> str:
             elif tool_name == "consultar_estadisticas_generales":
                 resultado = consultar_estadisticas_generales(
                     consulta = tool_input.get("consulta", ""),
+                )
+            elif tool_name == "predecir_con_itinerario":
+                resultado = predecir_con_itinerario(
+                    service_category = tool_input.get("service_category", ""),
+                    seller_id        = tool_input.get("seller_id", ""),
+                    sla_horas        = tool_input.get("sla_horas", 48),
+                    created_at       = tool_input.get("created_at", ""),
+                    eventos          = tool_input.get("eventos", []),
                 )
             else:
                 resultado = {"error": f"Herramienta {tool_name} no encontrada"}
